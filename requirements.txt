@@ -1,0 +1,10 @@
+numpy==1.26.4
+torch
+torchvision
+opencv-python
+scikit-learn
+streamlit
+ultralytics
+Pillow
+plotly
+pandas

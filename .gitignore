@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+
+# Virtual environment
+venv/
+env/
+.venv/
+
+# Model weights (too large for GitHub)
+*.pt
+*.pth
+*.onnx
+*.bin
+
+# Database (local only)
+database/visioncart.db
+
+# Embeddings (regenerated on registration)
+data/embeddings/
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# Node / Next.js
+vision-cart-web/node_modules/
+vision-cart-web/.next/
+vision-cart-web/.env.local
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+*.swp

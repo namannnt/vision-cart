@@ -1,0 +1,28 @@
+{
+  "date": "2026-03-15 13:39:26",
+  "device": "cuda",
+  "products_tested": 3,
+  "total_attempts": 38,
+  "total_correct": 34,
+  "overall_accuracy": 89.47368421052632,
+  "per_product": {
+    "controller": {
+      "correct": 20,
+      "attempts": 20,
+      "accuracy": 100.0,
+      "avg_time": 141.31646156311035
+    },
+    "controller A": {
+      "correct": 14,
+      "attempts": 18,
+      "accuracy": 77.77777777777779,
+      "avg_time": 104.78187931908502
+    },
+    "sanitizer": {
+      "correct": 0,
+      "attempts": 0,
+      "accuracy": 0,
+      "avg_time": 0
+    }
+  }
+}

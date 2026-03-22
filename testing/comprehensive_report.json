@@ -1,0 +1,61 @@
+{
+  "test_date": "2026-03-15 14:16:03",
+  "system_info": {
+    "device": "cuda",
+    "products_in_database": 4,
+    "ai_models": [
+      "YOLO11x-seg",
+      "CLIP ViT-B/32",
+      "DINOv2 ViT-B/14"
+    ]
+  },
+  "test_results": {
+    "detection_accuracy": {},
+    "recognition_accuracy": {
+      "controller": {
+        "correct": 19,
+        "detected": 19,
+        "attempts": 20,
+        "detection_rate": 95.0,
+        "recognition_accuracy": 100.0,
+        "avg_detection_time": 105.35221350820441,
+        "avg_confidence": 0.8750078834985432
+      },
+      "controller A": {
+        "correct": 20,
+        "detected": 20,
+        "attempts": 20,
+        "detection_rate": 100.0,
+        "recognition_accuracy": 100.0,
+        "avg_detection_time": 60.41446924209595,
+        "avg_confidence": 0.8807689398527145
+      },
+      "sanitizer": {
+        "correct": 0,
+        "detected": 0,
+        "attempts": 20,
+        "detection_rate": 0,
+        "recognition_accuracy": 0,
+        "avg_detection_time": 94.16861534118652,
+        "avg_confidence": 0
+      },
+      "medicine ": {
+        "correct": 0,
+        "detected": 0,
+        "attempts": 20,
+        "detection_rate": 0,
+        "recognition_accuracy": 0,
+        "avg_detection_time": 101.35304927825928,
+        "avg_confidence": 0
+      }
+    },
+    "performance_metrics": {},
+    "stress_test_results": {},
+    "error_handling": {}
+  },
+  "summary": {
+    "overall_detection_rate": 48.75,
+    "overall_recognition_accuracy": 100.0,
+    "end_to_end_accuracy": 48.75
+  }
+}
