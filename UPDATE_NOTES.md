@@ -313,8 +313,6 @@ If you find this project useful, please ⭐ star it on GitHub!
 
 **Built with ❤️ by the VisionCart Team**
 
-**Co-developed with AI Assistant (Claude Sonnet 4.5)**
-
 ---
 
 ## 📊 Changelog
