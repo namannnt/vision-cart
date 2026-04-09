@@ -1,0 +1,13 @@
+# Ignore Python backend files (deploy separately)
+../*.py
+../models/
+../utils/
+../database/
+../data/
+../*.pt
+../requirements*.txt
+../Dockerfile
+../app.py
+../config.py
+../venv/
+../__pycache__/
