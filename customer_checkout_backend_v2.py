@@ -66,16 +66,13 @@ class CheckoutCounter:
         self.cart = []
         self.last_detected_product = None
         self.last_detection_time = 0
-        self.cooldown_seconds_default = 8  # For products with siblings
-        self.cooldown_seconds_unique = 3   # For unique products (faster!)
+        self.cooldown_seconds = 8
         self.detection_count = {}
         self.recent_detections = []
         
         # Multi-frame voting buffer
         self.vote_buffer: dict = {}
-        # ADAPTIVE voting: 3 frames for size variants, 1 frame for unique products
-        self.vote_required_default = 3  # For products with siblings
-        self.vote_required_unique = 1   # For products without siblings (instant!)
+        self.vote_required = 3
     
     def _build_parent_index(self):
         """Build index: parent_id -> [product_indices]"""
@@ -90,64 +87,36 @@ class CheckoutCounter:
     def _size_based_filtering(self, query_shape, query_diameter_mm, coin_present, candidate_indices):
         """
         STAGE 1: Size-based filtering BEFORE embedding comparison
+        This is the KEY to preventing wrong size detection
         
-        Strategy:
-        1. Try EXACT match (within tolerance)
-        2. If no exact match, find CLOSEST match
-        
-        Returns: filtered_indices (products that pass size check)
+        Returns: filtered_indices (only products that pass size check)
         """
         if not candidate_indices:
             return []
         
-        exact_matches = []
-        size_distances = []  # (idx, distance) for closest matching
+        filtered = []
         
         for idx in candidate_indices:
             # Method 1: Coin-based real size (MOST ACCURATE)
             if coin_present and query_diameter_mm > 5.0 and self.real_diameters[idx] > 5.0:
-                distance = abs(query_diameter_mm - self.real_diameters[idx])
-                
-                # Try exact match first (±10mm tolerance)
-                if distance <= 10.0:
-                    exact_matches.append(idx)
+                if real_size_gate(query_diameter_mm, self.real_diameters[idx], tolerance_mm=10.0):
+                    filtered.append(idx)
+                    continue
                 else:
-                    # Store for closest matching
-                    size_distances.append((idx, distance))
-                continue
+                    # Size mismatch — skip this candidate
+                    continue
             
             # Method 2: Frame-based size ratio (FALLBACK)
             if self.shape_feats[idx] is not None:
-                query_ratio = query_shape[3]  # size_ratio
-                db_ratio = self.shape_feats[idx][3]
-                
-                if db_ratio > 1e-4:
-                    relative_diff = abs(query_ratio - db_ratio) / db_ratio
-                    
-                    # Try exact match first (±20% tolerance)
-                    if relative_diff <= 0.20:
-                        exact_matches.append(idx)
-                    else:
-                        # Store for closest matching
-                        size_distances.append((idx, relative_diff))
-                else:
-                    exact_matches.append(idx)  # No data, allow
+                # Use VERY STRICT tolerance for parent groups
+                if size_gate(query_shape, self.shape_feats[idx], tolerance=0.20):
+                    filtered.append(idx)
+                    continue
             else:
                 # No size data — allow it (benefit of doubt)
-                exact_matches.append(idx)
+                filtered.append(idx)
         
-        # Return exact matches if found
-        if exact_matches:
-            return exact_matches
-        
-        # No exact match — return CLOSEST match
-        if size_distances:
-            # Sort by distance (smallest first)
-            size_distances.sort(key=lambda x: x[1])
-            closest_idx = size_distances[0][0]
-            return [closest_idx]  # Return only the closest one
-        
-        return []
+        return filtered
     
     def _hierarchical_matching(self, query_emb, query_shape, query_color, query_diameter_mm, coin_present):
         """
@@ -200,9 +169,8 @@ class CheckoutCounter:
             
             if not size_filtered:
                 # No candidate passed size check in this parent group
-                # This shouldn't happen with closest matching, but just in case
                 if coin_present:
-                    best_message = f"⚠️ Unexpected: No size match found"
+                    best_message = f"⚠️ Size mismatch - Detected {query_diameter_mm:.1f}mm but no matching variant"
                 else:
                     best_message = f"⚠️ Ambiguous size - Place ₹1 coin for accurate detection"
                 continue
@@ -334,40 +302,22 @@ class CheckoutCounter:
             
             product_name = self.product_ids[idx]
             
-            # ADAPTIVE VOTING: Determine required votes based on product type
-            # If product has siblings (size variants) → 3 frames for safety
-            # If product is unique (no siblings) → 1 frame for speed!
-            matched_parent = self.parent_ids[idx] if idx < len(self.parent_ids) else ""
-            has_siblings = False
-            
-            if matched_parent and matched_parent in self.parent_groups:
-                siblings = self.parent_groups[matched_parent]
-                has_siblings = len(siblings) > 1
-            
-            vote_required = self.vote_required_default if has_siblings else self.vote_required_unique
-            
             # Multi-frame voting
             if self.vote_buffer.get("product") != product_name:
-                self.vote_buffer = {"product": product_name, "count": 1, "required": vote_required}
+                self.vote_buffer = {"product": product_name, "count": 1}
             else:
                 self.vote_buffer["count"] += 1
-                self.vote_buffer["required"] = vote_required  # Update in case it changed
 
-            if self.vote_buffer["count"] < vote_required:
-                if has_siblings:
-                    return False, product_name, score, f"Confirming size variant... ({self.vote_buffer['count']}/{vote_required})"
-                else:
-                    return False, product_name, score, f"Confirming... ({self.vote_buffer['count']}/{vote_required})"
+            if self.vote_buffer["count"] < self.vote_required:
+                return False, product_name, score, f"Confirming... ({self.vote_buffer['count']}/{self.vote_required})"
 
-            # Oscillation check - prevent rapid re-detection
+            # Oscillation check
             self.recent_detections.append(product_name)
             if len(self.recent_detections) > 10:
                 self.recent_detections.pop(0)
             
-            # Relaxed: 4+ times in last 6 frames (was 3+ in 5)
-            # Allows legitimate re-scans after item removal
-            recent_count = self.recent_detections[-6:].count(product_name)
-            if recent_count >= 4:
+            recent_count = self.recent_detections[-5:].count(product_name)
+            if recent_count >= 3:
                 self.vote_buffer.clear()
                 return False, product_name, score, "⚠️ Already detected recently - Remove item"
             
@@ -381,11 +331,10 @@ class CheckoutCounter:
             if stock <= 0:
                 return False, product_name, score, "OUT OF STOCK"
             
-            # Adaptive cooldown check
-            cooldown = self.cooldown_seconds_default if has_siblings else self.cooldown_seconds_unique
+            # Cooldown check
             current_time = time.time()
             if (product_name == self.last_detected_product and 
-                current_time - self.last_detection_time < cooldown):
+                current_time - self.last_detection_time < self.cooldown_seconds):
                 return False, product_name, score, "⏳ Cooldown active - Remove item"
             
             # Check if already in cart
@@ -411,19 +360,8 @@ class CheckoutCounter:
             if stock <= 3:
                 warning = f" (Only {stock} left!)"
 
-            # Size info with match type
-            size_info = ""
-            if coin_present and query_diameter_mm > 5.0:
-                registered_size = self.real_diameters[idx]
-                if registered_size > 5.0:
-                    diff = abs(query_diameter_mm - registered_size)
-                    if diff <= 10.0:
-                        size_info = f" [Exact: {query_diameter_mm:.1f}mm]"
-                    else:
-                        size_info = f" [Closest: {query_diameter_mm:.1f}mm → {registered_size:.1f}mm]"
-            
-            speed_info = " ⚡" if not has_siblings else ""  # Lightning bolt for instant detection
-            return True, product_name, score, f"Added to cart{speed_info}{size_info}{warning}"
+            size_info = f" [{query_diameter_mm:.1f}mm]" if coin_present else ""
+            return True, product_name, score, f"Added to cart{size_info}{warning}"
         
         except Exception as e:
             import traceback
@@ -444,16 +382,7 @@ class CheckoutCounter:
     def remove_last_item(self):
         """Remove last item from cart"""
         if len(self.cart) > 0:
-            removed = self.cart.pop()
-            # Clear recent detections for removed item to allow re-scanning
-            if removed and 'name' in removed:
-                # Remove all occurrences of this product from recent detections
-                self.recent_detections = [p for p in self.recent_detections if p != removed['name']]
-            # Reset last detected if it was this product
-            if self.last_detected_product == removed.get('name'):
-                self.last_detected_product = None
-                self.last_detection_time = 0
-            return removed
+            return self.cart.pop()
         return None
     
     def checkout(self):

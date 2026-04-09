@@ -7,11 +7,11 @@ def validate_detection(results, frame, final_crop, binary_mask):
     Returns: (is_valid, reason)
     """
     
-    # RULE 1 — Confidence Threshold (RELAXED)
+    # RULE 1 — Confidence Threshold (relaxed for non-standard products)
     if len(results[0].boxes.conf) == 0:
         return False, "No detection"
     
-    if results[0].boxes.conf[0] < 0.5:  # Lowered from 0.65
+    if results[0].boxes.conf[0] < 0.10:  # Very relaxed — YOLO runs at conf=0.10
         return False, "Low confidence"
     
     # RULE 2 — Area Threshold (RELAXED)
@@ -32,7 +32,7 @@ def validate_detection(results, frame, final_crop, binary_mask):
     gray = cv2.cvtColor(final_crop, cv2.COLOR_BGR2GRAY)
     blur_score = cv2.Laplacian(gray, cv2.CV_64F).var()
     
-    if blur_score < 80:  # Lowered from 100
+    if blur_score < 40:  # Relaxed — flat tins can have lower variance
         return False, "Image too blurry"
     
     # RULE 5 — Empty Mask Check (RELAXED)

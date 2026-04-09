@@ -94,39 +94,18 @@ def camera_thread_function():
             with latest_raw_frame_lock:
                 latest_raw_frame = frame.copy()
 
-            display = frame.copy()
             frame_count += 1
 
-            # Run AI detection every 5 frames
-            if frame_count % 5 == 0:
-                detected, product, confidence, message = counter.detect_and_add_to_cart(frame)
+            # Queue frame for AI detection every 3 frames (faster response)
+            if frame_count % 3 == 0:
+                threading.Thread(
+                    target=run_detection_async,
+                    args=(frame.copy(),),
+                    daemon=True
+                ).start()
 
-                # Debug log every 30 frames (every ~1 second)
-                if frame_count % 30 == 0:
-                    print(f"[Detection] detected={detected} product={product} conf={confidence:.2f} msg={message}")
-
-                if detected:
-                    cv2.putText(display, f"ADDED: {product}", (20, 50),
-                                cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 3)
-
-                    with cart_state_lock:
-                        cart_state["items"] = counter.cart.copy()
-                        cart_state["total"] = counter.get_cart_total()
-                        cart_state["status"] = f"Detected {product}!"
-
-                    # Safe async broadcast using captured main loop
-                    try:
-                        if _main_loop is not None and _main_loop.is_running():
-                            asyncio.run_coroutine_threadsafe(
-                                manager.broadcast(cart_state), _main_loop)
-                            print(f"[Broadcast] Sent cart update: {product}")
-                        else:
-                            print("[Broadcast] ⚠️ Main loop not ready yet")
-                    except Exception as be:
-                        print(f"[Broadcast] Error: {be}")
-
-            # Resize and encode for web stream
-            display_small = cv2.resize(display, (640, 480))
+            # Encode for web stream immediately — never blocked by AI
+            display_small = cv2.resize(frame, (640, 480))
             ret2, buffer = cv2.imencode('.jpg', display_small,
                                         [cv2.IMWRITE_JPEG_QUALITY, 60])
             if ret2:
@@ -138,6 +117,47 @@ def camera_thread_function():
         except Exception as e:
             print(f"⚠️ Camera thread error: {e}")
             time.sleep(0.5)
+
+
+_detection_lock = threading.Lock()
+
+def run_detection_async(frame):
+    """Run AI detection in a separate thread so camera feed is never blocked."""
+    global cart_state
+    # Skip if a detection is already running
+    if not _detection_lock.acquire(blocking=False):
+        return
+    try:
+        detected, product, confidence, message = counter.detect_and_add_to_cart(frame)
+
+        # Update cart state regardless of detection result (for status messages)
+        with cart_state_lock:
+            cart_state["items"] = counter.cart.copy()
+            cart_state["total"] = counter.get_cart_total()
+            
+            if detected:
+                cart_state["status"] = f"✅ Added {product}!"
+            elif product:
+                # Show progress messages (Confirming..., etc.)
+                cart_state["status"] = message
+            else:
+                # No detection or error
+                cart_state["status"] = message if message else "Scanning..."
+
+        # Broadcast to all connected clients
+        try:
+            if _main_loop is not None and _main_loop.is_running():
+                asyncio.run_coroutine_threadsafe(
+                    manager.broadcast(cart_state), _main_loop)
+        except Exception as be:
+            print(f"[Broadcast] Error: {be}")
+            
+    except Exception as e:
+        print(f"⚠️ Detection thread error: {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        _detection_lock.release()
 
 # Start camera immediately in background
 threading.Thread(target=camera_thread_function, daemon=True).start()
@@ -163,6 +183,15 @@ def generate_mjpeg_stream():
         time.sleep(0.033)
 
 
+@app.post("/api/reload_database")
+def reload_database_endpoint():
+    """Called after inventory changes (delete/update) to refresh in-memory embeddings"""
+    counter.product_ids, counter.db_embeddings, counter.prices, counter.stocks, \
+        counter.color_hists, counter.shape_feats, counter.real_diameters, counter.parent_ids = load_database()
+    counter.booster.reset()
+    return {"status": "ok", "products": len(counter.product_ids)}
+
+
 @app.get("/debug/detection")
 def debug_detection():
     """Test endpoint — runs one detection on current frame and returns result"""
@@ -176,11 +205,27 @@ def debug_detection():
     return {
         "detected": detected,
         "product": product,
-        "confidence": round(float(confidence), 4),
+        "confidence": round(float(confidence), 4) if confidence else 0,
         "message": message,
         "cart_size": len(counter.cart),
-        "db_products": len(counter.product_ids)
+        "db_products": len(counter.product_ids),
+        "vote_buffer": counter.vote_buffer,
+        "recent_detections": counter.recent_detections[-5:] if counter.recent_detections else []
     }
+
+
+@app.get("/api/status")
+def get_status():
+    """Get current system status"""
+    with cart_state_lock:
+        return {
+            "cart": cart_state,
+            "camera_active": latest_raw_frame is not None,
+            "products_loaded": len(counter.product_ids),
+            "vote_buffer": counter.vote_buffer,
+            "last_detected": counter.last_detected_product,
+            "cooldown_remaining": max(0, counter.cooldown_seconds - (time.time() - counter.last_detection_time))
+        }
 
 
 @app.get("/video_feed")
@@ -244,10 +289,11 @@ from models.dinov2 import dino_loader
 from utils.clip_embedding import get_clip_embedding
 from utils.dino_embedding import get_dino_embedding
 from utils.embedding_fusion import fuse_embeddings
-from utils.segmentation_crop import apply_segmentation_mask, crop_to_mask
+from utils.segmentation_crop import apply_segmentation_mask, crop_to_mask, fallback_crop_no_yolo
 from utils.load_database import load_database
 from utils.color_layer import extract_color_histogram
 from utils.shape_layer import extract_shape_features
+from utils.coin_size_estimator import detect_coin, pixels_per_mm, estimate_product_real_diameter_mm
 from PIL import Image
 
 import numpy as np
@@ -258,6 +304,8 @@ class RegisterRequest(BaseModel):
     stock: int
     is_cylindrical: bool = False
     capture_step: int = 1
+    parent_id: str = ""
+    require_coin: bool = False  # if True, block registration when coin not in frame
 
 partial_registrations = {}
 
@@ -269,25 +317,49 @@ async def register_new_product(request: RegisterRequest):
         if latest_raw_frame is None:
             return {"error": "Camera stream not initialized. Please wait a moment."}
         frame = latest_raw_frame.copy()
+    
+    # --- COIN DETECTION CHECK (if required) ---
+    coin = detect_coin(frame)
+    if request.require_coin and coin is None:
+        return {"error": "⚠️ Coin not detected in frame. Place a ₹1 coin in the corner and try again."}
         
     try:
-        results = counter.yolo_model(frame, conf=0.35, verbose=False)
-        
-        if results[0].masks is None or len(results[0].masks) == 0:
-            return {"error": "No object detected in frame"}
-            
-        mask = results[0].masks.data[0].cpu().numpy()
-        mask = cv2.resize(mask, (frame.shape[1], frame.shape[0]))
-        
-        clean_img, binary_mask = apply_segmentation_mask(frame, mask)
-        final_crop = crop_to_mask(clean_img, mask)
-        
+        results = counter.yolo_model(frame, conf=0.10, verbose=False)
+
+        # Skip person class (0) — pick largest non-person masked object
+        SKIP_CLASSES = {0}
+        best_idx = None
+        best_area = -1
+        if results[0].masks is not None:
+            boxes = results[0].boxes
+            for i in range(len(results[0].masks)):
+                cls = int(boxes.cls[i]) if boxes is not None else -1
+                if cls in SKIP_CLASSES:
+                    continue
+                m = results[0].masks.data[i].cpu().numpy()
+                area = m.sum()
+                if area > best_area:
+                    best_area = area
+                    best_idx = i
+
+        if best_idx is not None:
+            mask = results[0].masks.data[best_idx].cpu().numpy()
+            mask = cv2.resize(mask, (frame.shape[1], frame.shape[0]))
+            clean_img, binary_mask = apply_segmentation_mask(frame, mask)
+            final_crop = crop_to_mask(clean_img, mask)
+        else:
+            # YOLO fallback — GrabCut center crop
+            final_crop, binary_mask = fallback_crop_no_yolo(frame)
+            if final_crop is None or final_crop.size == 0:
+                return {"error": "⚠️ No product detected in frame. Show the product clearly to the camera."}
+
         if final_crop is None or final_crop.size == 0:
             return {"error": "Invalid segmentation crop"}
             
-        is_valid, reason = validate_detection(results, frame, final_crop, binary_mask)
-        if not is_valid:
-            return {"error": f"Invalid detection: {reason}"}
+        if best_idx is not None:
+            is_valid, reason = validate_detection(results, frame, final_crop, binary_mask)
+            if not is_valid:
+                return {"error": f"Invalid detection: {reason}"}
             
         pil_crop = Image.fromarray(cv2.cvtColor(final_crop, cv2.COLOR_BGR2RGB))
         clip_emb = get_clip_embedding(pil_crop, clip_loader.model, clip_loader.preprocess, counter.device)
@@ -317,21 +389,40 @@ async def register_new_product(request: RegisterRequest):
         color_hist = extract_color_histogram(final_crop_for_save)
         shape_feat = extract_shape_features(final_crop_for_save, binary_mask)
 
-        existing_embeddings = get_all_embeddings()
-        if len(existing_embeddings) > 0 and is_duplicate(final_embedding, existing_embeddings, threshold=0.95):
+        # --- Coin-based real size measurement ---
+        real_diameter_mm = 0.0
+        if coin is not None:
+            ppm = pixels_per_mm(coin[2])
+            real_diameter_mm = estimate_product_real_diameter_mm(binary_mask, ppm)
+            print(f"📏 Coin detected — product real diameter: {real_diameter_mm:.1f}mm")
+        else:
+            print("⚠️ No coin detected — size measurement skipped")
+
+        parent_id = request.parent_id.strip() if request.parent_id else None
+
+        existing_ids, existing_embeddings = get_all_embeddings()
+        if len(existing_embeddings) > 0 and is_duplicate(
+            final_embedding.reshape(1, -1), existing_embeddings,
+            threshold=0.95, existing_ids=existing_ids, parent_id=parent_id
+        ):
             return {"error": "DUPLICATE DETECTED: Product physically identical to existing item."}
 
         success, message = register_product(
             request.product_id, request.price, request.stock, final_embedding,
-            color_hist=color_hist, shape_feat=shape_feat
+            color_hist=color_hist, shape_feat=shape_feat,
+            real_diameter_mm=real_diameter_mm, parent_id=parent_id
         )
 
         if success:
             image_path = f"data/registered_products/{request.product_id}.jpg"
             cv2.imwrite(image_path, final_crop_for_save)
             counter.product_ids, counter.db_embeddings, counter.prices, counter.stocks, \
-                counter.color_hists, counter.shape_feats = load_database()
-            return {"status": "success", "message": message}
+                counter.color_hists, counter.shape_feats, counter.real_diameters, counter.parent_ids = load_database()
+            counter.booster.reset()
+            counter.last_detected_product = request.product_id
+            counter.last_detection_time = time.time() + 10
+            size_info = f" | Size: {real_diameter_mm:.1f}mm" if real_diameter_mm > 0 else " | No coin detected"
+            return {"status": "success", "message": message + size_info}
         else:
             return {"error": message}
             

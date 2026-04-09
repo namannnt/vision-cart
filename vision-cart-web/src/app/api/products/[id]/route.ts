@@ -1,6 +1,15 @@
 import { NextResponse } from 'next/server';
 import { openDb } from '@/lib/db';
 
+// Notify Python backend to reload its in-memory DB
+async function notifyBackendReload() {
+  try {
+    await fetch('http://127.0.0.1:8000/api/reload_database', { method: 'POST' });
+  } catch {
+    // backend might not be running, non-blocking
+  }
+}
+
 export async function DELETE(
   request: Request,
   { params }: { params: Promise<{ id: string }> }
@@ -13,14 +22,15 @@ export async function DELETE(
 
     const db = await openDb();
     
-    // Check if product exists first
     const product = await db.get('SELECT * FROM products WHERE id = ?', [id]);
     if (!product) {
       return NextResponse.json({ error: 'Product not found' }, { status: 404 });
     }
 
-    // Delete from database
     await db.run('DELETE FROM products WHERE id = ?', [id]);
+    
+    // Tell Python backend to reload — deleted product won't be detected anymore
+    await notifyBackendReload();
     
     return NextResponse.json({ success: true, message: 'Product deleted successfully' });
   } catch (error) {
@@ -48,17 +58,18 @@ export async function PUT(
 
     const db = await openDb();
     
-    // Check if product exists
     const product = await db.get('SELECT * FROM products WHERE id = ?', [id]);
     if (!product) {
       return NextResponse.json({ error: 'Product not found' }, { status: 404 });
     }
 
-    // Update in database
     await db.run(
       'UPDATE products SET price = ?, stock = ? WHERE id = ?',
       [parseFloat(price), parseInt(stock, 10), id]
     );
+
+    // Tell Python backend to reload updated price/stock
+    await notifyBackendReload();
     
     return NextResponse.json({ success: true, message: 'Product updated successfully' });
   } catch (error) {
